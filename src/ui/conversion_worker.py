@@ -75,6 +75,71 @@ class ConversionWorker(QObject):
         self.transcription_parser = TranscriptionParser(signals_forwarder=self.signals)
         self.is_running = True
 
+    def _transcribe_single_file(self, audio_path, provider):
+        """转录单个音频文件"""
+        if provider == CLOUD_PROVIDER_ELEVENLABS_WEB:
+            lang_from_dialog = self.cloud_transcription_params.get("language", "auto")
+            num_speakers = self.cloud_transcription_params.get("num_speakers", 0)
+            tag_events = self.cloud_transcription_params.get("tag_audio_events", True)
+            
+            return self.elevenlabs_stt_client.transcribe_audio(
+                audio_file_path=audio_path, language_code=lang_from_dialog,
+                num_speakers=num_speakers, tag_audio_events=tag_events
+            )
+        return None
+
+    def _transcribe_split_audio(self, chunk_info, provider, original_audio_path):
+        """转录分割后的多个音频片段并合并结果"""
+        import datetime
+        from core.audio_extractor import merge_elevenlabs_transcriptions
+        
+        chunk_json_files = []
+        
+        for i, (chunk_path, start_time, end_time) in enumerate(chunk_info, 1):
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            duration = end_time - start_time
+            self.signals.log_message.emit(f"[{timestamp}] 正在转录片段 {i}/{len(chunk_info)} ({duration:.1f}秒)")
+            
+            chunk_data = self._transcribe_single_file(chunk_path, provider)
+            
+            if not chunk_data:
+                self.signals.log_message.emit(f"片段 {i} 转录失败")
+                return None
+            
+            base_name = os.path.splitext(os.path.basename(chunk_path))[0]
+            chunk_json_path = os.path.join(self.output_dir, f"{base_name}.elevenlabs.asr.json")
+            
+            try:
+                with open(chunk_json_path, "w", encoding="utf-8") as f:
+                    json.dump(chunk_data, f, ensure_ascii=False, indent=2)
+                chunk_json_files.append(chunk_json_path)
+                self.signals.log_message.emit(f"✓ 片段 {i} 转录完成")
+            except Exception as e:
+                self.signals.log_message.emit(f"保存片段 {i} JSON 失败: {e}")
+                return None
+        
+        self.signals.log_message.emit(f"正在合并 {len(chunk_json_files)} 个转录结果...")
+        
+        original_base_name = os.path.splitext(os.path.basename(original_audio_path))[0]
+        merged_json_path = os.path.join(self.output_dir, f"{original_base_name}.elevenlabs.asr.json")
+        
+        success, message = merge_elevenlabs_transcriptions(
+            chunk_json_files, chunk_info, merged_json_path
+        )
+        
+        if not success:
+            self.signals.log_message.emit(f"合并 JSON 失败: {message}")
+            return None
+        
+        self.signals.log_message.emit(f"✓ {message}")
+        
+        try:
+            with open(merged_json_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            self.signals.log_message.emit(f"读取合并 JSON 失败: {e}")
+            return None
+
     def stop(self):
         """停止当前工作线程，尝试优雅地终止所有任务"""
         if not self.is_running:
@@ -147,16 +212,31 @@ class ConversionWorker(QObject):
 
                 self.signals.log_message.emit("--- 开始免费在线转录 (ElevenLabs Web) ---")
                 audio_path = self.free_transcription_params["audio_file_path"]
+                
+                # 获取音频文件信息
+                from core.audio_extractor import get_media_info
+                media_info = get_media_info(audio_path)
+                if media_info:
+                    duration_min = media_info['duration'] / 60
+                    self.signals.log_message.emit(f"音频文件: {os.path.basename(audio_path)}")
+                    self.signals.log_message.emit(f"时长: {duration_min:.1f} 分钟")
+                
                 lang_from_dialog = self.free_transcription_params.get("language")
                 num_speakers = self.free_transcription_params.get("num_speakers")
                 tag_events = self.free_transcription_params.get("tag_audio_events", True)
+                
+                self.signals.log_message.emit("正在上传音频并转录，请耐心等待...")
+                self.signals.log_message.emit("(ElevenLabs Web 免费版无进度反馈，转录时间取决于音频长度)")
 
                 transcription_data = self.elevenlabs_stt_client.transcribe_audio(
                     audio_file_path=audio_path, language_code=lang_from_dialog,
                     num_speakers=num_speakers, tag_audio_events=tag_events
                 )
+                
                 if not self.is_running: self.signals.finished.emit("任务在ElevenLabs Web API调用后被取消。", False); return
                 if transcription_data is None: self.signals.finished.emit("ElevenLabs Web API 转录失败或返回空。", False); return
+                
+                self.signals.log_message.emit("✓ 转录完成！")
 
                 current_overall_progress = PROGRESS_STT_COMPLETE_FREE
                 self.signals.progress.emit(current_overall_progress)
@@ -179,28 +259,78 @@ class ConversionWorker(QObject):
 
             # 云端转录模式：支持多种服务商
             elif self.input_mode == "cloud_transcription":
+                import datetime
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                
+                print(f"[{timestamp}] [DEBUG] 进入云端转录模式")
+                
                 if not self.cloud_transcription_params or not self.cloud_transcription_params.get("audio_file_path"):
                     self.signals.finished.emit("错误：云端转录模式下未提供音频文件参数。", False); return
 
                 audio_path = self.cloud_transcription_params["audio_file_path"]
                 provider = self.cloud_transcription_params.get("provider", CLOUD_PROVIDER_ELEVENLABS_WEB)
+                
+                print(f"[{timestamp}] [DEBUG] 音频文件: {audio_path}")
+                print(f"[{timestamp}] [DEBUG] 服务商: {provider}")
+                
+                # [新增] 检查是否有音频分割信息
+                audio_split_info = self.cloud_transcription_params.get("audio_split_info", {})
+                chunk_info = audio_split_info.get(audio_path, None)
+                
+                print(f"[{timestamp}] [DEBUG] audio_split_info keys: {list(audio_split_info.keys())}")
+                print(f"[{timestamp}] [DEBUG] chunk_info: {chunk_info}")
 
                 self.signals.log_message.emit(f"--- 开始云端转录 ({provider}) ---")
-                transcription_data = None
-                actual_source_format = None
+                
+                # [新增] 如果有分割信息，处理多个片段
+                if chunk_info and len(chunk_info) > 1:
+                    print(f"[{timestamp}] [DEBUG] 检测到音频已分割为 {len(chunk_info)} 个片段")
+                    self.signals.log_message.emit(f"检测到音频已分割为 {len(chunk_info)} 个片段")
+                    
+                    print(f"[{timestamp}] [DEBUG] 调用 _transcribe_split_audio()...")
+                    transcription_data = self._transcribe_split_audio(
+                        chunk_info, provider, audio_path
+                    )
+                    print(f"[{timestamp}] [DEBUG] _transcribe_split_audio() 返回: {transcription_data is not None}")
+                    
+                    if not transcription_data:
+                        self.signals.finished.emit("分割音频转录失败", False)
+                        return
+                    actual_source_format = "elevenlabs" if provider == CLOUD_PROVIDER_ELEVENLABS_WEB else provider.replace("_api", "")
+                else:
+                    print(f"[{timestamp}] [DEBUG] 单文件转录模式")
+                    # 原有的单文件转录逻辑
+                    transcription_data = None
+                    actual_source_format = None
 
                 try:
                     if provider == CLOUD_PROVIDER_ELEVENLABS_WEB:
                         # 使用现有的ElevenLabs Web客户端
                         self.signals.log_message.emit("使用ElevenLabs (Web/Free) 服务")
+                        
+                        # 获取音频文件信息
+                        from core.audio_extractor import get_media_info
+                        media_info = get_media_info(audio_path)
+                        if media_info:
+                            duration_min = media_info['duration'] / 60
+                            self.signals.log_message.emit(f"音频文件: {os.path.basename(audio_path)}")
+                            self.signals.log_message.emit(f"时长: {duration_min:.1f} 分钟")
+                        
                         lang_from_dialog = self.cloud_transcription_params.get("language", "auto")
                         num_speakers = self.cloud_transcription_params.get("num_speakers", 0)
                         tag_events = self.cloud_transcription_params.get("tag_audio_events", True)
+                        
+                        self.signals.log_message.emit("正在上传音频并转录，请耐心等待...")
+                        self.signals.log_message.emit("(ElevenLabs Web 免费版无进度反馈，转录时间取决于音频长度)")
 
                         transcription_data = self.elevenlabs_stt_client.transcribe_audio(
                             audio_file_path=audio_path, language_code=lang_from_dialog,
                             num_speakers=num_speakers, tag_audio_events=tag_events
                         )
+                        
+                        if transcription_data:
+                            self.signals.log_message.emit("✓ 转录完成！")
+                        
                         actual_source_format = "elevenlabs"
 
                     elif provider == CLOUD_PROVIDER_ELEVENLABS_API:

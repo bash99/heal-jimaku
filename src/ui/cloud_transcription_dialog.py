@@ -49,6 +49,17 @@ from core.llm_api import call_llm_api_for_segmentation
 # [新增] 导入 OCR 模块
 from core.dots_ocr import run_dots_ocr
 
+# [新增] 导入音频提取模块
+from core.audio_extractor import (
+    is_video_file, is_audio_file, is_media_file,
+    cleanup_temp_ogg, get_media_info,
+    merge_elevenlabs_transcriptions,
+    VIDEO_EXTENSIONS, AUDIO_EXTENSIONS
+)
+
+# [新增] 导入音频处理 Worker 类
+from ui.audio_workers import AudioExtractionWorker, AudioSplittingWorker
+
 # 文件处理库导入（处理可能的导入错误）
 try:
     import docx
@@ -658,6 +669,16 @@ class CloudTranscriptionDialog(QDialog):
         self._pending_ocr_content = None
         self._pending_ocr_error = None
 
+        # [新增] 音频提取相关状态
+        self.audio_extraction_worker = None
+        self.is_extracting_audio = False
+        self.extracted_audio_files = {}  # 原始视频路径 -> 提取的OGG路径
+        self.audio_split_info = {}  # 原始音频路径 -> [(chunk_path, start_time, end_time)]
+        
+        # [新增] 音频分割相关状态
+        self.audio_splitting_worker = None
+        self.is_splitting_audio = False
+
         # === 窗口尺寸配置 ===
         self.DIALOG_SIZES = {
             0: (900, 650),  # Web版
@@ -813,7 +834,7 @@ class CloudTranscriptionDialog(QDialog):
         layout.addLayout(title_bar_layout)
 
     def _create_file_selection_area(self, layout):
-        file_group = QGroupBox("音频文件")
+        file_group = QGroupBox("音频/视频文件")
         file_group.setStyleSheet(self._get_group_style())
         
         file_layout = QVBoxLayout(file_group)
@@ -824,7 +845,7 @@ class CloudTranscriptionDialog(QDialog):
         input_layout.setSpacing(10)
 
         self.file_path_entry = QLineEdit()
-        self.file_path_entry.setPlaceholderText("请点击浏览按钮选择音频文件...") 
+        self.file_path_entry.setPlaceholderText("请点击浏览按钮选择音频/视频文件...") 
         self.file_path_entry.setReadOnly(True)
         self.file_path_entry.setStyleSheet(self._get_input_style())
         self.file_path_entry.setMinimumHeight(38)
@@ -839,7 +860,7 @@ class CloudTranscriptionDialog(QDialog):
         input_layout.addWidget(browse_btn)
         file_layout.addLayout(input_layout)
 
-        hint_label = QLabel("📁 支持批量选择多个音频文件进行处理")
+        hint_label = QLabel("📁 支持批量选择多个音频/视频文件进行处理（视频将自动提取音频）")
         hint_label.setStyleSheet("color: rgba(242, 234, 218, 0.9); font-size: 13px; font-weight: bold; padding-left: 2px;")
         file_layout.addWidget(hint_label)
 
@@ -1689,7 +1710,11 @@ class CloudTranscriptionDialog(QDialog):
 
     def _select_audio_file(self):
         curr_dir = os.path.dirname(self.selected_audio_file_path) if self.selected_audio_file_path else os.path.expanduser("~")
-        files, _ = QFileDialog.getOpenFileNames(self, "选择音频", curr_dir, "音频文件 (*.mp3 *.wav *.flac *.m4a *.ogg *.aac);;所有文件 (*)")
+        # [修改] 添加视频格式支持
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择音频/视频文件", curr_dir,
+            "音频/视频文件 (*.mp3 *.wav *.flac *.m4a *.ogg *.aac *.mkv *.mp4 *.avi *.webm *.mov *.flv *.wmv *.m4v *.ts *.mts);;音频文件 (*.mp3 *.wav *.flac *.m4a *.ogg *.aac);;视频文件 (*.mkv *.mp4 *.avi *.webm *.mov *.flv *.wmv *.m4v *.ts *.mts);;所有文件 (*)"
+        )
         if files:
             if len(files) == 1:
                 self.selected_audio_file_path = files[0]
@@ -1765,119 +1790,24 @@ class CloudTranscriptionDialog(QDialog):
     def _confirm_settings(self):
         """确认设置并开始转录"""
         if not self.selected_audio_file_path and not self.selected_audio_files:
-            QMessageBox.warning(self, "警告", "请先选择音频文件")
+            QMessageBox.warning(self, "警告", "请先选择音频/视频文件")
             return
-            
-        self._confirmed = True  # 标记已确认
 
-        idx = self.provider_combo.currentIndex()
-        providers = [CLOUD_PROVIDER_ELEVENLABS_WEB, CLOUD_PROVIDER_ELEVENLABS_API, CLOUD_PROVIDER_SONIOX_API]
-        current_provider = providers[idx]
-        
-        # 基于现有配置创建副本
-        settings = self.current_settings.copy()
-        
-        # 更新通用设置
-        settings.update({
-            'audio_file_path': self.selected_audio_file_path,
-            'audio_files': self.selected_audio_files,
-            'provider': current_provider
-        })
+        # [新增] 检查是否有视频文件需要提取音频
+        video_files_to_extract = []
+        if self.selected_audio_file_path and is_video_file(self.selected_audio_file_path):
+            video_files_to_extract.append(self.selected_audio_file_path)
+        for f in self.selected_audio_files:
+            if is_video_file(f):
+                video_files_to_extract.append(f)
 
-        # 1. 收集 ElevenLabs Web 数据
-        if hasattr(self, 'el_web_language_combo'):
-            settings.update({
-                'language': SUPPORTED_LANGUAGES[self.el_web_language_combo.currentIndex()][0], # 针对Web版的当前选择
-                'num_speakers': self.el_web_speakers_spin.value(),
-                'tag_audio_events': self.el_web_audio_events_check.isChecked()
-            })
-            
-        # 2. 收集 ElevenLabs API 数据
-        if hasattr(self, 'el_api_key_edit'):
-            el_key = self.el_api_key_edit.text().strip()
-            el_remember = self.el_api_remember_check.isChecked()
-            
-            # 检查 Key (如果是当前选择的提供商)
-            if current_provider == CLOUD_PROVIDER_ELEVENLABS_API and not el_key:
-                self._confirmed = False
-                return QMessageBox.warning(self, "警告", "请输入 ElevenLabs API Key")
-            
-            # 更新当前任务配置
-            if current_provider == CLOUD_PROVIDER_ELEVENLABS_API:
-                 settings.update({
-                    'api_key': el_key,
-                    'language': SUPPORTED_LANGUAGES[self.el_api_language_combo.currentIndex()][0], # 覆盖上面的 language
-                    'num_speakers': self.el_api_speakers_spin.value(), # 覆盖上面的 num_speakers
-                    'enable_diarization': self.el_api_diarization_check.isChecked(),
-                    'tag_audio_events': self.el_api_audio_events_check.isChecked() # 覆盖上面的 tag_audio_events
-                 })
-            
-            # 持久化保存
-            settings.update({
-                'elevenlabs_api_key': el_key if el_remember else "",
-                'elevenlabs_api_remember_key': el_remember,
-                'elevenlabs_api_language': SUPPORTED_LANGUAGES[self.el_api_language_combo.currentIndex()][0],
-                'elevenlabs_api_num_speakers': self.el_api_speakers_spin.value(),
-                'elevenlabs_api_enable_diarization': self.el_api_diarization_check.isChecked(),
-                'elevenlabs_api_tag_audio_events': self.el_api_audio_events_check.isChecked()
-            })
+        # 如果有视频文件，先进行音频提取
+        if video_files_to_extract:
+            self._start_video_audio_extraction(video_files_to_extract)
+            return
 
-        # 3. 收集 Soniox API 数据
-        if hasattr(self, 'soniox_api_key_edit'):
-            sx_key = self.soniox_api_key_edit.text().strip()
-            sx_remember = self.soniox_api_remember_check.isChecked()
-            
-            if current_provider == CLOUD_PROVIDER_SONIOX_API and not sx_key:
-                self._confirmed = False
-                return QMessageBox.warning(self, "警告", "请输入 Soniox API Key")
-
-            if current_provider == CLOUD_PROVIDER_SONIOX_API:
-                settings.update({
-                    'api_key': sx_key,
-                })
-            
-            hints = []
-            if hasattr(self, 'soniox_language_list'):
-                for i in range(self.soniox_language_list.count()):
-                    item = self.soniox_language_list.item(i)
-                    if item.checkState() == Qt.CheckState.Checked:
-                        hints.append(item.data(Qt.ItemDataRole.UserRole))
-
-            # === [新增] Context 8000 字符限制处理 ===
-            raw_context = self.soniox_context_edit.toPlainText().strip()
-
-            # Soniox 限制 context 长度不能超过字数限制 (通常安全值为 8000 左右)
-            SONIOX_MAX_CONTEXT_LENGTH = 8000
-            if len(raw_context) > SONIOX_MAX_CONTEXT_LENGTH:
-                # 超出限制时提醒用户，不自动截断
-                QMessageBox.warning(self, "文本长度超出限制",
-                    f"当前清洗后的文本长度为 {len(raw_context)} 字符，超过了 Soniox API 的 8000 字符限制。\n\n"
-                    f"建议的处理方式：\n"
-                    f"1. 手动截取前 8000 字符中最重要的部分\n"
-                    f"2. 将内容拆分为多个较短的文件分别处理\n"
-                    f"3. 只保留关键的背景设定，分别处理台词部分\n\n"
-                    f"请修改剧情设定内容后再继续。")
-                truncated_context = raw_context  # 不进行截断，让用户自行处理
-            else:
-                truncated_context = raw_context
-
-            # 持久化保存
-            settings.update({
-                'soniox_api_key': sx_key if sx_remember else "",
-                'soniox_api_remember_key': sx_remember,
-                'soniox_language_hints': hints,
-                'soniox_enable_speaker_diarization': self.soniox_diarization_check.isChecked(),
-                'soniox_enable_language_identification': self.soniox_language_identification_check.isChecked(),
-                'soniox_context_terms': [t.strip() for t in self.soniox_terms_edit.toPlainText().split('\n') if t.strip()],
-
-                # [修改] 使用处理后的 truncated_context
-                'soniox_context_text': truncated_context,
-
-                'soniox_context_general': []
-            })
-            
-        self.settings_confirmed.emit(settings)
-        self.accept()
+        # 没有视频文件，直接执行确认逻辑
+        self._do_confirm_settings()
 
     def _show_result_safe(self, btn, ok, msg):
         """线程安全的结果显示方法"""
@@ -1970,6 +1900,21 @@ class CloudTranscriptionDialog(QDialog):
 
     def closeEvent(self, event):
         """点击窗口关闭按钮(X)时触发，保存状态后关闭"""
+        # 清理所有工作线程
+        if hasattr(self, 'audio_splitting_worker') and self.audio_splitting_worker:
+            if self.audio_splitting_worker.isRunning():
+                self.audio_splitting_worker.quit()
+                self.audio_splitting_worker.wait(2000)
+            self.audio_splitting_worker.deleteLater()
+            self.audio_splitting_worker = None
+        
+        if hasattr(self, 'audio_extraction_worker') and self.audio_extraction_worker:
+            if self.audio_extraction_worker.isRunning():
+                self.audio_extraction_worker.quit()
+                self.audio_extraction_worker.wait(2000)
+            self.audio_extraction_worker.deleteLater()
+            self.audio_extraction_worker = None
+        
         if not self._confirmed: # 如果已经点击了确定，这里就不需要再保存了
             self._save_keys_to_parent()
         super().closeEvent(event)
@@ -2150,3 +2095,442 @@ class CloudTranscriptionDialog(QDialog):
         # 触发父窗口保存到磁盘
         if hasattr(self.parent_window, 'save_config'):
             self.parent_window.save_config()
+
+    # ==================== 视频音频提取相关方法 ====================
+
+    def _start_video_audio_extraction(self, video_files: list):
+        """开始视频音频提取流程"""
+        if self.is_extracting_audio:
+            QMessageBox.warning(self, "警告", "正在提取音频，请稍候...")
+            return
+
+        self.is_extracting_audio = True
+        self._video_files_to_extract = video_files.copy()
+        self._current_extraction_index = 0
+        self.extracted_audio_files = {}
+
+        # 显示提示
+        total = len(video_files)
+        QMessageBox.information(
+            self, "视频音频提取",
+            f"检测到 {total} 个视频文件，将自动提取音频后进行转录。\n\n"
+            "音频将转换为 OGG 格式（16kHz 单声道，适合语音识别）。\n"
+            "提取完成后将自动继续转录流程。"
+        )
+
+        # 开始提取第一个文件
+        self._extract_next_video()
+
+    def _extract_next_video(self):
+        """提取下一个视频文件的音频"""
+        if self._current_extraction_index >= len(self._video_files_to_extract):
+            # 所有视频都已提取完成
+            self._on_all_extractions_complete()
+            return
+
+        video_path = self._video_files_to_extract[self._current_extraction_index]
+        total = len(self._video_files_to_extract)
+        current = self._current_extraction_index + 1
+
+        # 更新文件显示
+        self.file_path_entry.setText(f"[{current}/{total}] 正在提取: {os.path.basename(video_path)}")
+
+        # 创建并启动提取工作线程
+        self.audio_extraction_worker = AudioExtractionWorker(video_path)
+        self.audio_extraction_worker.finished.connect(self._on_extraction_finished)
+        self.audio_extraction_worker.error.connect(self._on_extraction_error)
+        self.audio_extraction_worker.progress.connect(self._on_extraction_progress)
+        self.audio_extraction_worker.start()
+
+    def _on_extraction_progress(self, percent: float):
+        """音频提取进度回调"""
+        video_path = self._video_files_to_extract[self._current_extraction_index]
+        total = len(self._video_files_to_extract)
+        current = self._current_extraction_index + 1
+        self.file_path_entry.setText(
+            f"[{current}/{total}] 提取中 {percent:.0f}%: {os.path.basename(video_path)}"
+        )
+
+    def _on_extraction_finished(self, output_path: str, message: str):
+        """单个视频音频提取完成回调"""
+        # 断开信号连接
+        if self.audio_extraction_worker:
+            self.audio_extraction_worker.finished.disconnect(self._on_extraction_finished)
+            self.audio_extraction_worker.error.disconnect(self._on_extraction_error)
+            self.audio_extraction_worker.progress.disconnect(self._on_extraction_progress)
+            self.audio_extraction_worker = None
+
+        # 记录提取结果
+        video_path = self._video_files_to_extract[self._current_extraction_index]
+        self.extracted_audio_files[video_path] = output_path
+        print(f"[音频提取] {video_path} -> {output_path}")
+
+        # 继续下一个
+        self._current_extraction_index += 1
+        self._extract_next_video()
+
+    def _on_extraction_error(self, error_message: str):
+        """音频提取错误回调"""
+        # 断开信号连接
+        if self.audio_extraction_worker:
+            self.audio_extraction_worker.finished.disconnect(self._on_extraction_finished)
+            self.audio_extraction_worker.error.disconnect(self._on_extraction_error)
+            self.audio_extraction_worker.progress.disconnect(self._on_extraction_progress)
+            self.audio_extraction_worker = None
+
+        video_path = self._video_files_to_extract[self._current_extraction_index]
+        self.is_extracting_audio = False
+        self._update_file_display()
+
+        QMessageBox.critical(
+            self, "音频提取失败",
+            f"无法从视频文件提取音频：\n{os.path.basename(video_path)}\n\n错误：{error_message}"
+        )
+
+    def _on_all_extractions_complete(self):
+        """所有视频音频提取完成"""
+        self.is_extracting_audio = False
+
+        # 替换视频文件路径为提取的音频文件路径
+        if self.selected_audio_file_path and self.selected_audio_file_path in self.extracted_audio_files:
+            self.selected_audio_file_path = self.extracted_audio_files[self.selected_audio_file_path]
+
+        new_audio_files = []
+        for f in self.selected_audio_files:
+            if f in self.extracted_audio_files:
+                new_audio_files.append(self.extracted_audio_files[f])
+            else:
+                new_audio_files.append(f)
+        self.selected_audio_files = new_audio_files
+
+        # 更新显示
+        self._update_file_display()
+
+        # [新增] 检查是否需要分割长音频（仅针对 ElevenLabs Web 免费版）
+        idx = self.provider_combo.currentIndex()
+        providers = [CLOUD_PROVIDER_ELEVENLABS_WEB, CLOUD_PROVIDER_ELEVENLABS_API, CLOUD_PROVIDER_SONIOX_API]
+        current_provider = providers[idx]
+        
+        if current_provider == CLOUD_PROVIDER_ELEVENLABS_WEB:
+            # [修复] 使用 QTimer 延迟执行，避免在信号处理中直接调用
+            QTimer.singleShot(100, self._check_and_split_long_audio)
+        else:
+            # 其他服务商不需要分割，直接继续
+            QTimer.singleShot(100, self._do_confirm_settings)
+
+    def _check_and_split_long_audio(self):
+        """检查并分割超过30分钟的音频文件（仅用于 ElevenLabs Web）"""
+        MAX_DURATION = 1800.0  # 30 分钟
+        SPLIT_DURATION = 1680.0  # 28 分钟
+        
+        files_to_check = []
+        if self.selected_audio_file_path:
+            files_to_check.append(self.selected_audio_file_path)
+        files_to_check.extend(self.selected_audio_files)
+        
+        # 检查哪些文件需要分割
+        files_need_split = []
+        for audio_file in files_to_check:
+            if not audio_file:
+                continue
+            info = get_media_info(audio_file)
+            if info and info['duration'] > MAX_DURATION:
+                files_need_split.append((audio_file, info['duration']))
+        
+        if not files_need_split:
+            # 没有需要分割的文件，直接继续
+            self._do_confirm_settings()
+            return
+        
+        # 询问用户是否自动分割
+        total_files = len(files_need_split)
+        file_list = "\n".join([f"  • {os.path.basename(f)} ({d/60:.1f} 分钟)" for f, d in files_need_split])
+        
+        reply = QMessageBox.question(
+            self, "检测到长音频文件",
+            f"检测到 {total_files} 个音频文件超过 30 分钟：\n\n{file_list}\n\n"
+            "ElevenLabs Web 免费版最长支持 30 分钟转录。\n\n"
+            "是否自动分割为 28 分钟的片段？\n"
+            "（将在静音处智能分割，转录后自动合并结果）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        
+        if reply == QMessageBox.StandardButton.No:
+            # 用户拒绝分割，直接继续（可能会失败）
+            self._do_confirm_settings()
+            return
+        
+        # 开始分割流程
+        self._start_audio_splitting(files_need_split, SPLIT_DURATION)
+
+    def _start_audio_splitting(self, files_to_split, max_duration):
+        """开始音频分割流程"""
+        self._files_to_split = files_to_split
+        self._split_max_duration = max_duration
+        self._current_split_index = 0
+        self._split_results = {}  # {original_path: [chunk_info]}
+        self.is_splitting_audio = True
+        
+        # 显示提示
+        QMessageBox.information(
+            self, "开始分割音频",
+            f"将分割 {len(files_to_split)} 个长音频文件。\n\n"
+            "分割过程可能需要几分钟，请耐心等待。"
+        )
+        
+        # 开始分割第一个文件
+        self._split_next_audio()
+
+    def _split_next_audio(self):
+        """分割下一个音频文件"""
+        if self._current_split_index >= len(self._files_to_split):
+            # 所有文件都已分割完成
+            self._on_all_splits_complete()
+            return
+        
+        audio_path, duration = self._files_to_split[self._current_split_index]
+        total = len(self._files_to_split)
+        current = self._current_split_index + 1
+        
+        # 更新显示
+        self.file_path_entry.setText(
+            f"[{current}/{total}] 正在分割: {os.path.basename(audio_path)} ({duration/60:.1f}分钟)"
+        )
+        
+        # 创建并启动分割工作线程
+        self.audio_splitting_worker = AudioSplittingWorker(audio_path, duration, self._split_max_duration)
+        self.audio_splitting_worker.finished.connect(self._on_split_finished)
+        self.audio_splitting_worker.error.connect(self._on_split_error)
+        self.audio_splitting_worker.progress.connect(self._on_split_progress)
+        self.audio_splitting_worker.start()
+
+    def _on_split_progress(self, message: str):
+        """音频分割进度回调"""
+        total = len(self._files_to_split)
+        current = self._current_split_index + 1
+        self.file_path_entry.setText(f"[{current}/{total}] {message}")
+
+    def _on_split_finished(self, audio_path: str, chunk_info: list):
+        """单个音频分割完成回调"""
+        # 断开信号连接并清理线程
+        if self.audio_splitting_worker:
+            try:
+                self.audio_splitting_worker.finished.disconnect(self._on_split_finished)
+                self.audio_splitting_worker.error.disconnect(self._on_split_error)
+                self.audio_splitting_worker.progress.disconnect(self._on_split_progress)
+            except:
+                pass
+            
+            try:
+                if self.audio_splitting_worker.isRunning():
+                    self.audio_splitting_worker.quit()
+                    self.audio_splitting_worker.wait(1000)
+            except:
+                pass
+            
+            try:
+                self.audio_splitting_worker.deleteLater()
+                self.audio_splitting_worker = None
+            except:
+                pass
+        
+        # 记录分割结果
+        self._split_results[audio_path] = chunk_info
+        print(f"[音频分割] {audio_path} 分割为 {len(chunk_info)} 个片段")
+        
+        # 继续下一个
+        self._current_split_index += 1
+        self._split_next_audio()
+
+    def _on_split_error(self, audio_path: str, error_message: str):
+        """音频分割错误回调"""
+        # 断开信号连接
+        if self.audio_splitting_worker:
+            try:
+                self.audio_splitting_worker.finished.disconnect(self._on_split_finished)
+                self.audio_splitting_worker.error.disconnect(self._on_split_error)
+                self.audio_splitting_worker.progress.disconnect(self._on_split_progress)
+            except:
+                pass
+            
+            # 等待线程完成
+            if self.audio_splitting_worker.isRunning():
+                self.audio_splitting_worker.quit()
+                self.audio_splitting_worker.wait(1000)
+            
+            self.audio_splitting_worker.deleteLater()
+            self.audio_splitting_worker = None
+        
+        # 分割失败，记录错误但继续
+        print(f"[音频分割] 失败: {error_message}")
+        QMessageBox.warning(
+            self, "分割失败",
+            f"文件 {os.path.basename(audio_path)} 分割失败：\n{error_message}\n\n将使用原文件继续。"
+        )
+        
+        # 继续下一个
+        self._current_split_index += 1
+        self._split_next_audio()
+
+    def _on_all_splits_complete(self):
+        """所有音频分割完成"""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        
+        self.is_splitting_audio = False
+        
+        # 更新 audio_split_info
+        if self._split_results:
+            for original_path, chunk_info in self._split_results.items():
+                self.audio_split_info[original_path] = chunk_info
+            print(f"[{timestamp}] 成功分割 {len(self._split_results)} 个音频文件，转录完成后将自动合并结果")
+        
+        # 更新显示
+        self._update_file_display()
+        
+        # 延迟调用确认设置
+        QTimer.singleShot(100, self._do_confirm_settings)
+
+    def _do_confirm_settings(self):
+        """实际执行确认设置的逻辑（音频提取完成后调用）"""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        
+        self._confirmed = True  # 标记已确认
+
+        idx = self.provider_combo.currentIndex()
+        providers = [CLOUD_PROVIDER_ELEVENLABS_WEB, CLOUD_PROVIDER_ELEVENLABS_API, CLOUD_PROVIDER_SONIOX_API]
+        current_provider = providers[idx]
+
+        # 基于现有配置创建副本
+        settings = self.current_settings.copy()
+
+        # 更新通用设置
+        settings.update({
+            'audio_file_path': self.selected_audio_file_path,
+            'audio_files': self.selected_audio_files,
+            'provider': current_provider,
+            'extracted_audio_files': self.extracted_audio_files,  # 传递提取信息用于后续清理
+            'audio_split_info': self.audio_split_info  # 传递分割信息用于转录和合并
+        })
+        
+        print(f"[{timestamp}] audio_split_info 详细内容:")
+        for key, value in self.audio_split_info.items():
+            print(f"  原始文件: {key}")
+            print(f"  分割片段数: {len(value) if value else 0}")
+            if value:
+                for i, (chunk_path, start, end) in enumerate(value, 1):
+                    print(f"    片段{i}: {chunk_path} ({start:.1f}s - {end:.1f}s)")
+
+        # 1. 收集 ElevenLabs Web 数据
+        if hasattr(self, 'el_web_language_combo'):
+            settings.update({
+                'language': SUPPORTED_LANGUAGES[self.el_web_language_combo.currentIndex()][0],
+                'num_speakers': self.el_web_speakers_spin.value(),
+                'tag_audio_events': self.el_web_audio_events_check.isChecked()
+            })
+
+        # 2. 收集 ElevenLabs API 数据
+        if hasattr(self, 'el_api_key_edit'):
+            el_key = self.el_api_key_edit.text().strip()
+            el_remember = self.el_api_remember_check.isChecked()
+
+            if current_provider == CLOUD_PROVIDER_ELEVENLABS_API and not el_key:
+                self._confirmed = False
+                return QMessageBox.warning(self, "警告", "请输入 ElevenLabs API Key")
+
+            if current_provider == CLOUD_PROVIDER_ELEVENLABS_API:
+                settings.update({
+                    'api_key': el_key,
+                    'language': SUPPORTED_LANGUAGES[self.el_api_language_combo.currentIndex()][0],
+                    'num_speakers': self.el_api_speakers_spin.value(),
+                    'enable_diarization': self.el_api_diarization_check.isChecked(),
+                    'tag_audio_events': self.el_api_audio_events_check.isChecked()
+                })
+
+            settings.update({
+                'elevenlabs_api_key': el_key if el_remember else "",
+                'elevenlabs_api_remember_key': el_remember,
+                'elevenlabs_api_language': SUPPORTED_LANGUAGES[self.el_api_language_combo.currentIndex()][0],
+                'elevenlabs_api_num_speakers': self.el_api_speakers_spin.value(),
+                'elevenlabs_api_enable_diarization': self.el_api_diarization_check.isChecked(),
+                'elevenlabs_api_tag_audio_events': self.el_api_audio_events_check.isChecked()
+            })
+
+        # 3. 收集 Soniox API 数据
+        if hasattr(self, 'soniox_api_key_edit'):
+            sx_key = self.soniox_api_key_edit.text().strip()
+            sx_remember = self.soniox_api_remember_check.isChecked()
+
+            if current_provider == CLOUD_PROVIDER_SONIOX_API and not sx_key:
+                self._confirmed = False
+                return QMessageBox.warning(self, "警告", "请输入 Soniox API Key")
+
+            if current_provider == CLOUD_PROVIDER_SONIOX_API:
+                settings.update({'api_key': sx_key})
+
+            hints = []
+            if hasattr(self, 'soniox_language_list'):
+                for i in range(self.soniox_language_list.count()):
+                    item = self.soniox_language_list.item(i)
+                    if item.checkState() == Qt.CheckState.Checked:
+                        hints.append(item.data(Qt.ItemDataRole.UserRole))
+
+            raw_context = self.soniox_context_edit.toPlainText().strip()
+            SONIOX_MAX_CONTEXT_LENGTH = 8000
+            if len(raw_context) > SONIOX_MAX_CONTEXT_LENGTH:
+                QMessageBox.warning(self, "文本长度超出限制",
+                    f"当前文本长度为 {len(raw_context)} 字符，超过了 Soniox API 的 8000 字符限制。\n\n"
+                    f"请修改剧情设定内容后再继续。")
+                self._confirmed = False
+                return
+
+            settings.update({
+                'soniox_api_key': sx_key if sx_remember else "",
+                'soniox_api_remember_key': sx_remember,
+                'soniox_language_hints': hints,
+                'soniox_enable_speaker_diarization': self.soniox_diarization_check.isChecked(),
+                'soniox_enable_language_identification': self.soniox_language_identification_check.isChecked(),
+                'soniox_context_terms': [t.strip() for t in self.soniox_terms_edit.toPlainText().split('\n') if t.strip()],
+                'soniox_context_text': raw_context,
+                'soniox_context_general': []
+            })
+
+        # 保存设置供主窗口获取
+        self._pending_settings = settings
+        
+        # 清理所有工作线程
+        self._cleanup_all_workers()
+        
+        # 直接调用 accept，让对话框正常关闭
+        # 主窗口会在 exec() 返回后读取 _pending_settings
+        self.accept()
+    
+    def _cleanup_all_workers(self):
+        """清理所有工作线程"""
+        # 清理音频分割线程
+        if hasattr(self, 'audio_splitting_worker') and self.audio_splitting_worker:
+            try:
+                if self.audio_splitting_worker.isRunning():
+                    self.audio_splitting_worker.quit()
+                    if not self.audio_splitting_worker.wait(3000):
+                        self.audio_splitting_worker.terminate()
+                        self.audio_splitting_worker.wait(1000)
+                self.audio_splitting_worker.deleteLater()
+                self.audio_splitting_worker = None
+            except:
+                pass
+        
+        # 清理音频提取线程
+        if hasattr(self, 'audio_extraction_worker') and self.audio_extraction_worker:
+            try:
+                if self.audio_extraction_worker.isRunning():
+                    self.audio_extraction_worker.quit()
+                    if not self.audio_extraction_worker.wait(3000):
+                        self.audio_extraction_worker.terminate()
+                        self.audio_extraction_worker.wait(1000)
+                self.audio_extraction_worker.deleteLater()
+                self.audio_extraction_worker = None
+            except:
+                pass

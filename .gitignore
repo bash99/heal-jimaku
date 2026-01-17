@@ -24,6 +24,10 @@ MANIFEST
 *.sln
 *.sublime-workspace
 
+# ignore video files
+*.mkv
+samples/video_files
+
 # OS generated files
 .DS_Store
 Thumbs.db
