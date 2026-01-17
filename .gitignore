@@ -32,3 +32,7 @@ samples/video_files
 .DS_Store
 Thumbs.db
 *.backup
+
+# Pyinstall build
+build
+dist

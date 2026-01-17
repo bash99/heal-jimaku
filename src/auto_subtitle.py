@@ -67,17 +67,20 @@ def main():
   # 指定语言
   python auto_subtitle.py video.mp4 --language ja
 
-  # 临时覆盖 API Key
-  python auto_subtitle.py video.mp4 --api-key sk-xxx
+  # 使用 ElevenLabs API Key（推荐）
+  python auto_subtitle.py video.mp4 --elevenlabs-api-key YOUR_KEY
 
-  # 使用不同的配置
+  # 完整配置示例
   python auto_subtitle.py video.mp4 \\
-    --api-url https://api.openai.com/v1/chat/completions \\
-    --model gpt-4
+    --llm-api-key sk-xxx \\
+    --elevenlabs-api-key el-xxx \\
+    --language ja
 
 支持的语言: zh (中文), ja (日文), en (英文), ko (韩文)
 
-注意: 工具会自动读取 GUI 保存的配置（~/.heal_jimaku/config/config.json）
+注意: 
+  - 工具会自动读取 GUI 保存的配置（~/.heal_jimaku/config/config.json）
+  - ElevenLabs 免费版已失效，建议使用 API Key
         """
     )
     
@@ -88,8 +91,13 @@ def main():
     )
     
     parser.add_argument(
-        '--api-key',
+        '--llm-api-key',
         help='LLM API Key（可选，不指定则使用配置文件中的）'
+    )
+    
+    parser.add_argument(
+        '--elevenlabs-api-key',
+        help='ElevenLabs API Key（用于音频转录，可选）'
     )
     
     # 可选参数
@@ -139,33 +147,41 @@ def main():
     current_profile = app_config.get_current_llm_profile(saved_config)
     
     # 构建配置（命令行参数优先，否则使用配置文件）
-    api_key = args.api_key or current_profile.get('api_key', '')
+    llm_api_key = args.llm_api_key or current_profile.get('api_key', '')
     api_url = args.api_url if args.api_url != 'https://api.deepseek.com/v1/chat/completions' else current_profile.get('api_base_url', args.api_url)
     model = args.model if args.model != 'deepseek-chat' else current_profile.get('model_name', args.model)
     temperature = args.temperature if args.temperature != 0.3 else current_profile.get('temperature', args.temperature)
     
-    # 验证 API Key
-    if not api_key:
-        print("错误: 未找到 API Key")
-        print("请使用以下方式之一提供 API Key:")
+    # 获取 ElevenLabs API Key（命令行参数 > 配置文件）
+    elevenlabs_api_key = args.elevenlabs_api_key or saved_config.get(app_config.USER_ELEVENLABS_API_KEY_KEY, '')
+    
+    # 验证 LLM API Key
+    if not llm_api_key:
+        print("错误: 未找到 LLM API Key")
+        print("请使用以下方式之一提供 LLM API Key:")
         print("  1. 在 GUI 中保存 API Key")
-        print("  2. 使用 --api-key 参数")
+        print("  2. 使用 --llm-api-key 参数")
         sys.exit(1)
     
     config = {
-        'llm_api_key': api_key,
+        'llm_api_key': llm_api_key,
         'llm_api_url': api_url,
         'llm_model': model,
         'language': args.language,
         'max_chunk_duration': args.max_duration,
-        'temperature': temperature
+        'temperature': temperature,
+        'elevenlabs_api_key': elevenlabs_api_key  # 添加 ElevenLabs API Key
     }
     
     # 显示使用的配置
     print(f"使用配置:")
-    print(f"  API URL: {api_url}")
-    print(f"  模型: {model}")
-    print(f"  温度: {temperature}")
+    print(f"  LLM API URL: {api_url}")
+    print(f"  LLM 模型: {model}")
+    print(f"  LLM 温度: {temperature}")
+    if elevenlabs_api_key:
+        print(f"  ElevenLabs API Key: {elevenlabs_api_key[:10]}...{elevenlabs_api_key[-4:]}")
+    else:
+        print(f"  ElevenLabs: 使用免费版（可能失效）")
     if args.language:
         print(f"  语言: {args.language}")
     print()

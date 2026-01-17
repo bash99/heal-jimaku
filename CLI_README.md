@@ -1,4 +1,4 @@
-# 自动字幕生成工具 - 命令行版本
+# 命令行字幕生成工具
 
 独立的命令行工具，完全不依赖 GUI，实现视频自动生成字幕的完整流程。
 
@@ -7,7 +7,8 @@
 - ✅ **完全独立** - 不依赖 PyQt6 和 GUI 组件
 - ✅ **自动化流程** - 一条命令完成所有步骤
 - ✅ **智能分割** - 自动将长音频分割为 28 分钟片段（避开 ElevenLabs 30分钟限制）
-- ✅ **免费转录** - 使用 ElevenLabs Web 免费服务
+- ✅ **多种转录方式** - 支持 ElevenLabs API（推荐）或免费版（已失效）
+- ✅ **配置复用** - 自动读取 GUI 保存的配置
 - ✅ **LLM 优化** - 使用大模型优化字幕断句
 - ✅ **多语言支持** - 支持中文、日文、英文、韩文
 
@@ -37,27 +38,64 @@
 pip install av requests mutagen langdetect
 ```
 
+## 转录服务配置
+
+### 三种转录方式
+
+1. **ElevenLabs API（推荐）**
+   - 需要注册账号获取 API Key
+   - 稳定可靠，有免费额度
+   - 在 GUI 中保存或通过命令行参数指定
+
+2. **ElevenLabs Web 免费版**
+   - 无需 API Key
+   - **当前已失效**（返回 401 错误）
+   - 不推荐使用
+
+3. **Soniox API**
+   - 仅 GUI 支持，命令行暂不支持
+
+### 配置读取优先级
+
+命令行参数 > GUI 配置文件（`~/.heal_jimaku/config/config.json`）
+
 ## 使用方法
 
-### 基本使用（自动读取 GUI 配置）
+### 基本使用（推荐）
 
-工具会自动读取 GUI 保存的配置文件（`~/.heal_jimaku/config/config.json`），包括 API Key、API URL、模型等设置。
+在 GUI 中保存 API Key 后，命令行工具会自动读取：
 
 ```bash
-# 使用已保存的配置
+# 自动使用 GUI 保存的配置
 python src/auto_subtitle.py video.mp4
-```
 
-### 指定语言
-
-```bash
+# 指定语言
 python src/auto_subtitle.py video.mp4 --language ja
 ```
 
-### 临时覆盖 API Key
+### 使用 ElevenLabs API Key
 
 ```bash
-python src/auto_subtitle.py video.mp4 --api-key sk-xxx
+# 方式1: 临时指定（不保存到配置）
+python src/auto_subtitle.py video.mp4 --elevenlabs-api-key YOUR_KEY
+
+# 方式2: 在 GUI 中保存后直接使用
+python src/auto_subtitle.py video.mp4
+```
+
+### 完整配置示例
+
+```bash
+# 同时指定 LLM 和 ElevenLabs API Key
+python src/auto_subtitle.py video.mp4 \
+  --llm-api-key sk-xxx \
+  --elevenlabs-api-key el-xxx \
+  --language ja
+
+# 自定义分割时长
+python src/auto_subtitle.py video.mp4 \
+  --elevenlabs-api-key el-xxx \
+  --max-duration 1500
 ```
 
 支持的语言：
@@ -66,56 +104,23 @@ python src/auto_subtitle.py video.mp4 --api-key sk-xxx
 - `en` - 英文
 - `ko` - 韩文
 
-### 使用其他 LLM API（临时覆盖）
-
-```bash
-# 临时使用 OpenAI（不影响配置文件）
-python src/auto_subtitle.py video.mp4 \
-  --api-url https://api.openai.com/v1/chat/completions \
-  --model gpt-4 \
-  --api-key sk-xxx
-
-# 使用配置文件中的设置（推荐）
-# 在 GUI 中切换到对应的 LLM 配置，然后直接运行：
-python src/auto_subtitle.py video.mp4
-```
-
-### 自定义分割时长
-
-```bash
-# 分割为 25 分钟片段
-python src/auto_subtitle.py video.mp4 --api-key sk-xxx --max-duration 1500
-```
-
-### 完整参数示例
-
-```bash
-# 使用配置文件 + 指定语言
-python src/auto_subtitle.py video.mp4 --language ja
-
-# 完全自定义（临时覆盖所有配置）
-python src/auto_subtitle.py video.mp4 \
-  --api-key sk-xxx \
-  --api-url https://api.deepseek.com/v1/chat/completions \
-  --model deepseek-chat \
-  --language ja \
-  --max-duration 1680 \
-  --temperature 0.3
-```
-
 ## 参数说明
 
 | 参数 | 必需 | 默认值 | 说明 |
 |------|------|--------|------|
 | `video` | ✓ | - | 视频文件路径 |
-| `--api-key` | ✗ | 配置文件 | LLM API Key（可选，优先使用配置文件） |
-| `--api-url` | ✗ | 配置文件 | LLM API 地址（可选，优先使用配置文件） |
-| `--model` | ✗ | 配置文件 | LLM 模型名称（可选，优先使用配置文件） |
+| `--llm-api-key` | ✗ | 配置文件 | LLM API Key |
+| `--elevenlabs-api-key` | ✗ | 配置文件 | ElevenLabs API Key（推荐） |
+| `--api-url` | ✗ | 配置文件 | LLM API 地址 |
+| `--model` | ✗ | 配置文件 | LLM 模型名称 |
 | `--language` | ✗ | 自动检测 | 目标语言 (zh/ja/en/ko) |
-| `--max-duration` | ✗ | 1680 | 音频分割最大时长（秒） |
-| `--temperature` | ✗ | 配置文件 | LLM 温度参数（可选，优先使用配置文件） |
+| `--max-duration` | ✗ | 1680 | 音频分割最大时长（秒，28分钟） |
+| `--temperature` | ✗ | 配置文件 | LLM 温度参数 |
 
-**注意**: 命令行参数会临时覆盖配置文件中的设置，但不会修改配置文件。
+**注意**: 
+- 命令行参数会临时覆盖配置文件中的设置，但不会修改配置文件
+- 推荐在 GUI 中保存 API Key，命令行工具会自动读取
+- 无 ElevenLabs API Key 时会尝试免费版（已失效）
 
 ## 输出文件
 
@@ -173,9 +178,10 @@ python src/auto_subtitle.py video.mp4 \
 - 确保安装了 `av` 库：`pip install av`
 - 检查视频文件是否损坏
 
-### 问题：转录失败
-- ElevenLabs Web 服务可能有限制，稍后重试
-- 检查网络连接
+### 问题：转录失败（401 Unauthorized）
+- ElevenLabs 免费版已失效，需要使用 API Key
+- 注册 ElevenLabs 账号获取 API Key：https://elevenlabs.io
+- 在 GUI 中保存 API Key 或使用 `--elevenlabs-api-key` 参数
 
 ### 问题：LLM 调用失败
 - 检查 API Key 是否正确

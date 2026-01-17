@@ -187,16 +187,31 @@ class SubtitlePipeline:
         client = ElevenLabsSTTClient()
         json_files = []
         
+        # 获取 ElevenLabs API Key（如果有）
+        elevenlabs_api_key = self.config.get('elevenlabs_api_key', '')
+        
         for i, (chunk_path, start, end) in enumerate(chunks, 1):
             duration = end - start
             self._log(f"  [{i}/{len(chunks)}] 转录: {os.path.basename(chunk_path)} ({duration:.1f}秒)")
             
-            # 调用转录
-            result = client.transcribe_audio(
-                chunk_path,
-                language_code=self.config.get('language'),
-                tag_audio_events=True
-            )
+            # 根据是否有 API Key 选择不同的转录方法
+            if elevenlabs_api_key:
+                self._log(f"  使用 ElevenLabs API (付费版)")
+                result = client.transcribe_audio_official_api(
+                    audio_file_path=chunk_path,
+                    api_key=elevenlabs_api_key,
+                    language_code=self.config.get('language'),
+                    num_speakers=0,
+                    enable_diarization=True,
+                    tag_audio_events=True
+                )
+            else:
+                self._log(f"  使用 ElevenLabs Web (免费版，可能失效)")
+                result = client.transcribe_audio(
+                    chunk_path,
+                    language_code=self.config.get('language'),
+                    tag_audio_events=True
+                )
             
             if not result:
                 raise Exception(f"转录失败: {chunk_path}")

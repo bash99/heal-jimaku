@@ -2497,15 +2497,22 @@ class CloudTranscriptionDialog(QDialog):
                 'soniox_context_general': []
             })
 
-        # 保存设置供主窗口获取
-        self._pending_settings = settings
+        # 保存设置到父窗口配置
+        self._save_keys_to_parent()
         
-        # 清理所有工作线程
-        self._cleanup_all_workers()
+        # 更新父窗口的配置
+        if self.parent_window and hasattr(self.parent_window, 'cloud_transcription_settings'):
+            self.parent_window.cloud_transcription_settings.update(settings)
         
-        # 直接调用 accept，让对话框正常关闭
-        # 主窗口会在 exec() 返回后读取 _pending_settings
+        # 发射信号通知主窗口应用设置
+        self.settings_confirmed.emit(settings)
+        
+        # 关闭对话框
         self.accept()
+        
+        # 延迟启动转录流程（确保对话框已关闭）
+        if self.parent_window and hasattr(self.parent_window, 'start_conversion'):
+            QTimer.singleShot(100, self.parent_window.start_conversion)
     
     def _cleanup_all_workers(self):
         """清理所有工作线程"""

@@ -30,15 +30,20 @@ dist\heal-jimaku-cli.exe --help
 ## 使用示例
 
 ```bash
-# 基本使用
+# 基本使用（自动读取 GUI 配置）
 dist\heal-jimaku-cli.exe video.mp4
 
 # 指定语言
 dist\heal-jimaku-cli.exe video.mp4 --language ja
 
-# 使用自定义 API
-dist\heal-jimaku-cli.exe video.mp4 --api-key sk-xxx
+# 使用 ElevenLabs API Key
+dist\heal-jimaku-cli.exe video.mp4 --elevenlabs-api-key YOUR_KEY
+
+# 完整配置
+dist\heal-jimaku-cli.exe video.mp4 --llm-api-key sk-xxx --elevenlabs-api-key el-xxx
 ```
+
+详细使用说明请参考 [CLI_README.md](CLI_README.md)
 
 ## 故障排除
 
