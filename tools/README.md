@@ -43,7 +43,7 @@ python tools/auto_subtitle.py video.mp4 --language ja
 ### 使用 API Key
 
 ```bash
-# 使用 ElevenLabs API Key（推荐，免费版已失效）
+# 使用 ElevenLabs API Key（推荐，免费版的限制不清晰，有时报错）
 python tools/auto_subtitle.py video.mp4 --elevenlabs-api-key YOUR_ELEVENLABS_KEY
 
 # 使用 LLM API Key
@@ -136,7 +136,7 @@ pip install av
 
 ### 2. ElevenLabs 免费版失效
 
-ElevenLabs 免费版已经失效，建议使用 API Key：
+ElevenLabs 免费版有时候直接报错（封IP？），建议使用 API Key：
 
 ```bash
 python tools/auto_subtitle.py video.mp4 --elevenlabs-api-key YOUR_KEY
@@ -235,12 +235,3 @@ tools/
 ## 许可证
 
 本工具是 heal-jimaku 项目的一部分，遵循项目的开源许可证。
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
----
-
-**作者**: fuxiaomoke  
-**版本**: 0.2.2.0
