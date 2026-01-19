@@ -127,6 +127,8 @@ def extract_audio_to_ogg(
         # 添加 Vorbis 音频流 - 使用正确的 API
         output_audio_stream = output_container.add_stream('libvorbis', rate=sample_rate)
         output_audio_stream.codec_context.layout = 'mono' if channels == 1 else 'stereo'
+        from fractions import Fraction
+        output_audio_stream.codec_context.time_base = Fraction(1, sample_rate)
         
         # 创建重采样器
         resampler = av.AudioResampler(
@@ -137,13 +139,14 @@ def extract_audio_to_ogg(
         
         # 处理音频帧
         frame_count = 0
+        output_pts = 0
         for packet in input_container.demux(input_audio_stream):
             for frame in packet.decode():
                 frame_count += 1
                 
                 # 进度回调
                 if progress_callback and total_duration > 0:
-                    current_time = float(frame.pts * input_audio_stream.time_base) if frame.pts else 0
+                    current_time = float(frame.pts * input_audio_stream.time_base) if frame.pts is not None else 0
                     progress_callback(current_time, total_duration)
                 
                 # 重采样
@@ -151,6 +154,8 @@ def extract_audio_to_ogg(
                 
                 # 编码并写入
                 for resampled_frame in resampled_frames:
+                    resampled_frame.pts = output_pts
+                    output_pts += resampled_frame.samples
                     for out_packet in output_audio_stream.encode(resampled_frame):
                         output_container.mux(out_packet)
         
@@ -527,6 +532,8 @@ def extract_audio_segment(
         output_container = av.open(output_path, 'w')
         output_audio_stream = output_container.add_stream('libvorbis', rate=sample_rate)
         output_audio_stream.codec_context.layout = 'mono' if channels == 1 else 'stereo'
+        from fractions import Fraction
+        output_audio_stream.codec_context.time_base = Fraction(1, sample_rate)
         
         # 创建重采样器
         resampler = av.AudioResampler(
@@ -536,6 +543,7 @@ def extract_audio_segment(
         )
         
         # 处理音频帧
+        output_pts = 0
         for packet in input_container.demux(input_audio_stream):
             for frame in packet.decode():
                 if frame.pts is None:
@@ -554,6 +562,8 @@ def extract_audio_segment(
                 # 重采样并编码
                 resampled_frames = resampler.resample(frame)
                 for resampled_frame in resampled_frames:
+                    resampled_frame.pts = output_pts
+                    output_pts += resampled_frame.samples
                     for out_packet in output_audio_stream.encode(resampled_frame):
                         output_container.mux(out_packet)
         
